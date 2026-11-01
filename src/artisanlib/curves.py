@@ -1419,6 +1419,56 @@ class CurvesDlg(ArtisanDialog):
         renlogLayout.addWidget(logofileGroupWidget)
         webLayout = QHBoxLayout()
         webLayout.addWidget(WebLCDsGroupWidget)
+        # Web Mirror group
+        self.WebMirrorURL = QLabel()
+        self.WebMirrorURL.setOpenExternalLinks(True)
+        self.WebMirrorFlag = QCheckBox()
+        self.WebMirrorFlag.setChecked(self.aw.WebMirror)
+        self.WebMirrorFlag.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.WebMirrorPortLabel = QLabel(QApplication.translate('Label', 'Port'))
+        self.WebMirrorPort = QLineEdit(str(self.aw.WebMirrorPort))
+        self.WebMirrorPort.setAlignment(Qt.AlignmentFlag.AlignRight)
+        self.WebMirrorPort.setValidator(QRegularExpressionValidator(QRegularExpression(r'^[0-9]{1,4}$'),self))
+        self.WebMirrorPort.setMaximumWidth(45)
+        self.WebMirrorPort.setDisabled(self.aw.WebMirror)
+        self.WebMirrorQRpic = QLabel()
+        self.WebMirrorTokenLabel = QLabel()
+        self.WebMirrorTokenLabel.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        if self.aw.WebMirror:
+            try:
+                self.setWebMirrorURL()
+            except Exception: # pylint: disable=broad-except
+                self.WebMirrorURL.setText('')
+                self.WebMirrorQRpic.setPixmap(QPixmap())
+                self.WebMirrorTokenLabel.setText('')
+                self.aw.WebMirror = False
+        else:
+            self.WebMirrorURL.setText('')
+            self.WebMirrorQRpic.setPixmap(QPixmap())
+            self.WebMirrorTokenLabel.setText('')
+        self.WebMirrorPort.editingFinished.connect(self.changeWebMirrorPort)
+        self.WebMirrorFlag.clicked.connect(self.toggleWebMirror)
+        WebMirrorLayout = QHBoxLayout()
+        WebMirrorLayout.addWidget(self.WebMirrorFlag)
+        WebMirrorLayout.addWidget(self.WebMirrorPortLabel)
+        WebMirrorLayout.addWidget(self.WebMirrorPort)
+        WebMirrorLayout.addStretch()
+        WebMirrorVLayout = QVBoxLayout()
+        if not self.app.artisanviewerMode:
+            WebMirrorVLayout.addLayout(WebMirrorLayout)
+            WebMirrorVLayout.addWidget(self.WebMirrorURL)
+            WebMirrorVLayout.addWidget(self.WebMirrorQRpic)
+            WebMirrorVLayout.addWidget(self.WebMirrorTokenLabel)
+        else:
+            naLayout = QHBoxLayout()
+            notavailLable = QLabel(QApplication.translate('Label', 'Not available in ArtisanViewer'))
+            naLayout.addWidget(notavailLable)
+            naLayout.addStretch()
+            WebMirrorVLayout.addLayout(naLayout)
+        WebMirrorVLayout.addStretch()
+        WebMirrorGroupWidget = QGroupBox(QApplication.translate('GroupBox','Web Mirror'))
+        WebMirrorGroupWidget.setLayout(WebMirrorVLayout)
+        webLayout.addWidget(WebMirrorGroupWidget)
         webrenlogLayout = QHBoxLayout()
         webrenlogLayout.addLayout(renlogLayout)
         webrenlogLayout.addLayout(webLayout)
@@ -1681,6 +1731,67 @@ class CurvesDlg(ArtisanDialog):
             self.WebLCDsPort.setDisabled(False)
             self.WebLCDsURL.setText('')
             self.QRpic.setPixmap(QPixmap())
+
+    @pyqtSlot()
+    def changeWebMirrorPort(self) -> None:
+        try:
+            self.aw.WebMirrorPort = int(self.WebMirrorPort.text())
+        except Exception: # pylint: disable=broad-except
+            pass
+
+    def setWebMirrorURL(self) -> None:
+        url_str = self.getWebMirrorURL()
+        self.WebMirrorURL.setText(f'<a href="{url_str}">{url_str}</a>')
+        try:
+            from artisanlib.qrcode import QRlabel
+            qr = QRlabel(url_str)
+            self.WebMirrorQRpic.setPixmap(qr.make_image().pixmap())
+        except Exception: # pylint: disable=broad-except
+            pass
+        # Show token if server is active
+        if self.aw.webmirror_server is not None:
+            self.WebMirrorTokenLabel.setText(
+                QApplication.translate('Label', 'Token') + f': {self.aw.WebMirrorToken}')
+        else:
+            self.WebMirrorTokenLabel.setText('')
+
+    def getWebMirrorURL(self) -> str:
+        import socket
+        if sys.platform.startswith('darwin'):
+            import subprocess
+            host = subprocess.check_output(['scutil', '--get', 'LocalHostName']).decode('utf-8')
+        else:
+            host = socket.gethostname()
+        hostname = host.strip().replace(' ', '_').casefold()
+        token = self.aw.WebMirrorToken if self.aw.webmirror_server is not None else ''
+        base_url = f"http://{hostname}.local:{str(self.aw.WebMirrorPort)}/mirror"
+        if token:
+            return f"{base_url}#{token}"
+        return base_url
+
+    @pyqtSlot(bool)
+    def toggleWebMirror(self, b:bool = False) -> None:
+        res = False
+        if b:
+            try:
+                self.changeWebMirrorPort()
+                res = self.aw.startWebMirror()
+                if res:
+                    self.setWebMirrorURL()
+                    self.WebMirrorPort.setDisabled(True)
+                    self.WebMirrorFlag.setChecked(True)
+            except Exception as e: # pylint: disable=broad-except
+                self.aw.sendmessage(str(e))
+                res = False
+                self.aw.WebMirror = False
+        else:
+            self.aw.stopWebMirror()
+        if not res:
+            self.WebMirrorFlag.setChecked(False)
+            self.WebMirrorPort.setDisabled(False)
+            self.WebMirrorURL.setText('')
+            self.WebMirrorQRpic.setPixmap(QPixmap())
+            self.WebMirrorTokenLabel.setText('')
 
 
     def changedpi(self) -> None:

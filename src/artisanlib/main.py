@@ -59,6 +59,7 @@ signal.signal(signal.SIGINT, signal.SIG_DFL)
 import zlib
 import logging.config
 import json
+import secrets
 from collections.abc import Callable
 from pydantic import TypeAdapter, ValidationError
 from typing import Final, cast, Any, override, Literal, TYPE_CHECKING
@@ -166,6 +167,7 @@ if TYPE_CHECKING:
     from artisanlib.wheels import WheelDlg # pylint: disable=unused-import
     from artisanlib.hottop import Hottop # pylint: disable=unused-import
     from artisanlib.weblcds import WebLCDs, WebGreen, WebRoasted # pylint: disable=unused-import
+    from artisanlib.webmirror import WebMirror # pylint: disable=unused-import
     from artisanlib.santoker import Santoker # pylint: disable=unused-import
     from artisanlib.santoker_r import SantokerR # pylint: disable=unused-import
     from artisanlib.lebrew import Lebrew_RoastSeeNEXT # pylint: disable=unused-import
@@ -674,6 +676,7 @@ from artisanlib.widgets import (MyQLCDNumber, EventPushButton, MajorEventPushBut
 
 from artisanlib.notifications import Notification, NotificationManager, NotificationType
 from artisanlib.canvas import tgraphcanvas
+from artisanlib.webmirror import CONTROL_COMMANDS
 from artisanlib.phases_canvas import tphasescanvas
 from artisanlib.scale import ScaleManager
 
@@ -1392,6 +1395,7 @@ class ApplicationWindow(QMainWindow):
         'analysisresultsanno', 'segmentresultsanno', 'schedule_window', 'scheduleFlag', 'scheduled_items_uuids', 'largeLCDs_dialog', 'LargeLCDsFlag', 'largeDeltaLCDs_dialog', 'LargeDeltaLCDsFlag', 'largePIDLCDs_dialog',
         'LargePIDLCDsFlag', 'largeExtraLCDs_dialog', 'LargeExtraLCDsFlag', 'largePhasesLCDs_dialog', 'LargePhasesLCDsFlag', 'WebLCDs', 'WebLCDsPort', 'weblcds_server',
         'weblcds_index_path', 'weblcds_websocket_path',
+        'WebMirror', 'WebMirrorPort', 'WebMirrorToken', 'webmirror_index_path', 'webmirror_websocket_path', 'webmirror_server',
         'taskWebDisplayGreenActive', 'taskWebDisplayGreenPort', 'taskWebDisplayRoastedActive', 'taskWebDisplayRoastedPort',
         'taskWebDisplayRoastedIndexPath', 'taskWebDisplayRoastedWebSocketPath', 'taskWebDisplayGreen_server', 'taskWebDisplayRoasted_server',
         'custom_scale_ids', 'custom_scale_names',
@@ -1586,6 +1590,9 @@ class ApplicationWindow(QMainWindow):
         self.WebLCDs:bool = False
         self.WebLCDsPort:int = 8080
         self.WebLCDsAlerts:bool = False
+        self.WebMirror:bool = False
+        self.WebMirrorPort:int = 8081
+        self.WebMirrorToken:str = ''
 
         # Tasks Web Displays
         self.taskWebDisplayGreenActive:bool = False
@@ -1746,6 +1753,11 @@ class ApplicationWindow(QMainWindow):
         self.weblcds_index_path:Final[str] = 'artisan'
         self.weblcds_websocket_path:Final[str] = 'websocket'
         self.weblcds_server:WebLCDs|None = None # holds the WebLCD instance
+
+        # WebMirror
+        self.webmirror_index_path:Final[str] = 'mirror'
+        self.webmirror_websocket_path:Final[str] = 'websocket'
+        self.webmirror_server:WebMirror|None = None
 
         # Hottop
         self.hottop:Hottop|None = None # holds the Hottop instance created on connect; reset to None on disconnect
@@ -19340,6 +19352,15 @@ class ApplicationWindow(QMainWindow):
             settings.endGroup()
 #--- END GROUP WebLCDs
 
+#--- BEGIN GROUP WebMirror
+            # WebMirror
+            settings.beginGroup('WebMirror')
+            self.WebMirror = toBool(settings.value('active',self.WebMirror))
+            self.WebMirrorPort = toInt(settings.value('port',self.WebMirrorPort))
+            self.WebMirrorToken = toString(settings.value('token',self.WebMirrorToken))
+            settings.endGroup()
+#--- END GROUP WebMirror
+
 #--- BEGIN GROUP Tasks
             # Tasks
             settings.beginGroup('Tasks')
@@ -19448,6 +19469,9 @@ class ApplicationWindow(QMainWindow):
             # start Task Roasted Web Display
             if self.taskWebDisplayRoastedActive:
                 QTimer.singleShot(2002, self.startWebRoastedforced)
+            # start WebMirror server if needed
+            if self.WebMirror:
+                QTimer.singleShot(2003, self.startWebMirrorforced)
 
 
 #--- BEGIN GROUP ExtraEventButtons
@@ -19716,6 +19740,72 @@ class ApplicationWindow(QMainWindow):
             self.WebLCDs = False
         except Exception as e: # pylint: disable=broad-except
             _log.exception(e)
+
+    ## WebMirror
+
+    @pyqtSlot()
+    def startWebMirrorforced(self) -> None:
+        self.startWebMirror(force=True)
+
+    def startWebMirror(self, force:bool = False) -> bool:
+        try:
+            if not self.app.artisanviewerMode and (not self.WebMirror or force):
+                from artisanlib.webmirror import WebMirror
+                if force and self.webmirror_server is not None:
+                    # avoid leaking the running server/thread on a forced restart
+                    self.stopWebMirror()
+                if not self.WebMirrorToken:
+                    self.WebMirrorToken = secrets.token_urlsafe(16)
+                self.webmirror_server = WebMirror(
+                    self.WebMirrorPort,
+                    str(getResourcePath()),
+                    self.webmirror_index_path,
+                    self.webmirror_websocket_path,
+                    self)
+                res = self.webmirror_server.startWeb()
+                if res:
+                    self.WebMirror = True
+                    # seed the server with the current state, otherwise a client connecting
+                    # before the first sampling tick would wait for a snapshot that never comes
+                    self.qmc.refreshWebMirror()
+                    return True
+                self.stopWebMirror()
+                self.WebMirror = False
+                return False
+            return False
+        except ModuleNotFoundError:
+            self.qmc.adderror(QApplication.translate('Error Message','Exception: Web Mirror not supported by this build'))
+            self.stopWebMirror()
+            self.WebMirror = False
+            return False
+        except Exception as e: # pylint: disable=broad-except
+            _log.error(e)
+            self.qmc.adderror(QApplication.translate('Error Message','Could not start Web Mirror. Selected port might be busy.'))
+            self.stopWebMirror()
+            self.WebMirror = False
+            return False
+
+    def stopWebMirror(self) -> None:
+        try:
+            if self.webmirror_server is not None:
+                self.webmirror_server.stopWeb()
+            self.webmirror_server = None
+            self.WebMirror = False
+        except Exception as e: # pylint: disable=broad-except
+            _log.exception(e)
+
+    def control(self, cmd:str, token:str) -> dict[str,Any]:
+        # MirrorController implementation for WebMirror; called from the web server thread.
+        # Only the token gate lives here; the command itself is queued to the GUI thread
+        # via mirrorControlSignal, which validates the roast state before acting.
+        if not token or not secrets.compare_digest(token, self.WebMirrorToken):
+            return {'ok': False, 'error': 'unauthorized'}
+        if cmd not in CONTROL_COMMANDS:
+            return {'ok': False, 'error': 'unknown-command'}
+        self.qmc.mirrorControlSignal.emit(cmd)
+        # 'queued', not 'applied': the GUI thread may still refuse the command (e.g. an
+        # unsaved profile blocks START). The resulting state arrives in the next snapshot.
+        return {'ok': True, 'queued': True}
 
     ## WebGreen
 
@@ -21048,6 +21138,14 @@ class ApplicationWindow(QMainWindow):
             settings.endGroup()
 #--- END GROUP WebLCDs
 
+#--- BEGIN GROUP WebMirror
+            settings.beginGroup('WebMirror')
+            self.settingsSetValue(settings, default_settings, 'active',self.WebMirror, read_defaults)
+            self.settingsSetValue(settings, default_settings, 'port',self.WebMirrorPort, read_defaults)
+            self.settingsSetValue(settings, default_settings, 'token',self.WebMirrorToken, read_defaults)
+            settings.endGroup()
+#--- END GROUP WebMirror
+
 #--- BEGIN GROUP Tasks
             # Tasks
             settings.beginGroup('Tasks')
@@ -21420,6 +21518,9 @@ class ApplicationWindow(QMainWindow):
         if self.WebLCDs:
             self.stopWebLCDs()
             self.WebLCDs = True # to ensure they are started again on restart
+        if self.WebMirror:
+            self.stopWebMirror()
+            self.WebMirror = True # to ensure it is started again on restart
         if self.taskWebDisplayGreenActive:
             self.stopWebGreen()
             self.taskWebDisplayGreenActive = True # to ensure they are started again on restart

@@ -68,9 +68,11 @@ modules with Qt dependencies and complex canvas/graphics operations.
 =============================================================================
 """
 
+import json
 import os
 import sys
 from collections.abc import Generator
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock, patch
 
@@ -1509,3 +1511,69 @@ class TestFindTextGap:
         # Assert
         assert isinstance(ystep_down, int)
         assert isinstance(ystep_up, int)
+
+def create_mirror_stub(**overrides: Any) -> SimpleNamespace:
+    """Minimal stand-in for tgraphcanvas holding only what mirrorSnapshot reads."""
+    stub = SimpleNamespace(
+        flagon=True,
+        flagstart=True,
+        title='Test Roast',
+        temp1=[200.0, 201.0, 202.5],
+        temp2=[170.0, 180.0, 185.5],
+        delta1=[3.0, 3.5, 4.0],
+        delta2=[9.0, 8.5, 7.0],
+        timex=[0.0, 30.0, 60.0],
+        timeindex=[1, -1, 0, 0, 0, 0, 0],
+        specialevents=[2],
+        specialeventstype=[3],
+        specialeventsvalue=[190.0],
+        etypes=['A', 'B', 'C', 'D'],
+        aw=SimpleNamespace(qmc=SimpleNamespace(mode='C')),
+    )
+    for key, value in overrides.items():
+        setattr(stub, key, value)
+    return stub
+
+class TestMirrorSnapshot:
+    """Test the snapshot published to WebMirror clients."""
+
+    def test_charge_sets_time_origin(self) -> None:
+        """CHARGE at timeindex[0] becomes t=0, so pre-charge samples go negative."""
+        stub = create_mirror_stub()
+
+        snapshot = tgraphcanvas.mirrorSnapshot(stub, '185.5', '202.5', '00:30')
+
+        assert snapshot['curve']['t'] == [-30.0, 0.0, 30.0]
+        assert snapshot['state']['state'] == 'roasting'
+        assert snapshot['state']['rorBt'] == 7.0
+        assert snapshot['events'] == [
+            {'type': 0, 'label': 'CHARGE', 'time': 0.0, 'value': 180.0},
+            {'type': 13, 'label': 'D', 'time': 30.0, 'value': 190.0},
+        ]
+
+    def test_without_charge_time_starts_at_zero(self) -> None:
+        """An unset CHARGE (-1) keeps time relative to the first sample."""
+        stub = create_mirror_stub(timeindex=[-1, 0, 0, 0, 0, 0, 0], timex=[0.0, 60.0],
+                                 temp1=[201.0], temp2=[180.0], delta1=[], delta2=[],
+                                 specialevents=[], specialeventstype=[], specialeventsvalue=[])
+
+        snapshot = tgraphcanvas.mirrorSnapshot(stub, '--', '--', '')
+
+        assert snapshot['curve']['t'] == [0.0, 60.0]
+        assert snapshot['state']['timeLCD'] == '01:00'
+        assert snapshot['events'] == []
+
+    def test_non_finite_values_become_null(self) -> None:
+        """NaN/None readings are published as null so the payload stays JSON-safe."""
+        stub = create_mirror_stub(temp1=[float('nan'), 201.0], temp2=[None, 180.0],
+                                 delta1=[], delta2=[None], timex=[0.0, 60.0],
+                                 timeindex=[-1, 0, 0, 0, 0, 0, 0])
+
+        snapshot = tgraphcanvas.mirrorSnapshot(stub, '--', '--', '00:00')
+
+        assert snapshot['curve']['et'] == [None, 201.0]
+        assert snapshot['curve']['bt'] == [None, 180.0]
+        assert snapshot['curve']['rorBt'] == [None]
+        assert snapshot['state']['bt'] == 180.0
+        assert snapshot['state']['et'] == 201.0
+        assert '"state"' in json.dumps(snapshot)

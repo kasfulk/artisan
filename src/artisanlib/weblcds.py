@@ -52,7 +52,7 @@ class WebView:
 
         self._loop:        asyncio.AbstractEventLoop|None = None # the asyncio loop
         self._thread:      Thread|None                    = None # the thread running the asyncio loop
-        self._app = web.Application(debug=True)
+        self._app = web.Application()
         self.websockets_appkey = web.AppKey('websockets', weakref.WeakSet[web.WebSocketResponse])
         self._app[self.websockets_appkey] = weakref.WeakSet()
 

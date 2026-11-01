@@ -234,6 +234,7 @@ class tgraphcanvas(QObject):
     onMonitorSignal = pyqtSignal()
     toggleMonitorSignal = pyqtSignal()
     toggleRecorderSignal = pyqtSignal()
+    mirrorControlSignal = pyqtSignal(str)
     processAlarmSignal = pyqtSignal(int, bool, int, str)
     alarmsetSignal = pyqtSignal(int)
     moveBackgroundSignal = pyqtSignal(str, int)
@@ -290,7 +291,7 @@ class tgraphcanvas(QObject):
         'oncpick_cid', 'ondraw_cid', 'onmove_cid', 'rateofchange1', 'rateofchange2', 'flagon', 'flagstart', 'flagKeepON', 'flagOpenCompleted', 'flagsampling', 'flagsamplingthreadrunning',
         'manuallogETflag', 'zoom_follow', 'zoom_follow_onET', 'alignEvent', 'compareAlignEvent', 'compareEvents', 'compareET', 'compareBT', 'compareDeltaET', 'compareDeltaBT', 'compareMainEvents', 'compareBBP', 'compareRoast', 'compareExtraCurves1', 'compareExtraCurves2',
         'replayType', 'replayDropType', 'replayedBackgroundEvents', 'beepedBackgroundEvents', 'roastpropertiesflag', 'roastpropertiesAutoOpenFlag', 'roastpropertiesAutoOpenDropFlag',
-        'title', 'title_show_always', 'ambientTemp', 'ambientTempSource', 'ambientHumiditySource', 'ambientPressureSource', 'ambient_temperature_device', 'ambient_pressure', 'ambient_pressure_device', 'ambient_humidity',
+        'title', 'title_show_always', 'mirror_lcd', 'ambientTemp', 'ambientTempSource', 'ambientHumiditySource', 'ambientPressureSource', 'ambient_temperature_device', 'ambient_pressure', 'ambient_pressure_device', 'ambient_humidity',
         'ambient_humidity_device', 'elevation', 'temperaturedevicefunctionlist', 'humiditydevicefunctionlist', 'pressuredevicefunctionlist', 'moisture_greens', 'moisture_roasted',
         'greens_temp', 'beansize', 'beansize_min', 'beansize_max', 'whole_color', 'ground_color', 'color_systems', 'color_system_idx', 'heavyFC_flag', 'lowFC_flag', 'lightCut_flag',
         'darkCut_flag', 'drops_flag', 'oily_flag', 'uneven_flag', 'tipping_flag', 'scorching_flag', 'divots_flag', 'timex',
@@ -1041,6 +1042,10 @@ class tgraphcanvas(QObject):
 
         #list to store the time in seconds of each reading. Most IMPORTANT variable.
         self.timex:list[float] = []
+
+        # last LCD strings pushed to the WebMirror page, reused when the page has to be
+        # refreshed outside a sampling cycle (e.g. after a remote control command)
+        self.mirror_lcd:tuple[str, str, str] = ('', '', '')
 
         #lists to store temps and rates of change. Second most IMPORTANT variables. All need same dimension.
         #self.temp1 = ET ; self.temp2 = BT; self.delta1 = deltaMET; self.delta2 = deltaBT
@@ -2225,6 +2230,7 @@ class tgraphcanvas(QObject):
         self.onMonitorSignal.connect(self.OnMonitor, type=Qt.ConnectionType.QueuedConnection) # type: ignore[call-arg]
         self.toggleMonitorSignal.connect(self.toggleMonitorTigger)
         self.toggleRecorderSignal.connect(self.toggleRecorderTigger)
+        self.mirrorControlSignal.connect(self.mirrorControl, type=Qt.ConnectionType.QueuedConnection) # type: ignore[call-arg] # remote control arrives from the web server thread
         self.processAlarmSignal.connect(self.processAlarm, type=Qt.ConnectionType.QueuedConnection) # type: ignore[call-arg] # queued to avoid deadlock between RampSoak processing and EventRecordAction, both accessing the same critical section protected by profileDataSemaphore
         self.alarmsetSignal.connect(self.selectAlarmSet)
         self.moveBackgroundSignal.connect(self.moveBackgroundAndRedraw)
@@ -5256,6 +5262,11 @@ class tgraphcanvas(QObject):
             # LargeLCDs and WebLCDs
             if self.aw.WebLCDs:
                 self.updateWebLCDs(bt=btstr,et=etstr,time=timestr)
+            # WebMirror
+            try:
+                self.updateWebMirror(bt=btstr, et=etstr, time=timestr if timestr is not None else '')
+            except Exception as e: # pylint: disable=broad-except
+                _log.exception(e)
             try:
                 if timestr is None:
                     self.updateLargeLCDsReadingsSignal.emit(btstr,etstr)
@@ -5320,6 +5331,180 @@ class tgraphcanvas(QObject):
 
         except Exception as e: # pylint: disable=broad-except
             _log.exception(e)
+
+    def mirrorSnapshot(self, btLCD:str, etLCD:str, timeLCD:str) -> dict[str, Any]:
+        """Build a JSON-serializable snapshot of the current roast state for WebMirror.
+        
+        Must be called from the GUI thread. Normalizes None/numpy values for JSON safety.
+        """
+        def _safe_float(v:Any) -> float|None:
+            if v is None:
+                return None
+            try:
+                f = float(v)
+                return None if math.isnan(f) else f
+            except (TypeError, ValueError):
+                return None
+        
+        # State
+        on = self.flagon
+        recording = self.flagstart
+        if recording:
+            state_str = 'roasting'
+        elif on:
+            state_str = 'monitoring'
+        else:
+            state_str = 'off'
+        
+        # Current values (last sample)
+        bt:float|None = None
+        et:float|None = None
+        ror_bt:float|None = None
+        ror_et:float|None = None
+        if self.temp2:
+            bt = _safe_float(self.temp2[-1])
+        if self.temp1:
+            et = _safe_float(self.temp1[-1])
+        if self.delta2:
+            ror_bt = _safe_float(self.delta2[-1])
+        if self.delta1:
+            ror_et = _safe_float(self.delta1[-1])
+        
+        # Temperature unit
+        unit = self.aw.qmc.mode if hasattr(self.aw, 'qmc') and hasattr(self.aw.qmc, 'mode') else 'C'
+        
+        # Title
+        title = self.title if self.title else ''
+        
+        # Samples count
+        samples = len(self.timex)
+
+        # roast-relative time base: CHARGE (if marked) is t=0, as on the Artisan chart
+        t0 = 0.0
+        charge_idx = self.timeindex[0]
+        if 0 <= charge_idx < len(self.timex):
+            t0 = float(self.timex[charge_idx])
+        if not timeLCD and self.timex:
+            timeLCD = stringfromseconds(self.timex[-1] - t0)
+        
+        state_dict:dict[str, Any] = {
+            'on': on,
+            'recording': recording,
+            'state': state_str,
+            'btLCD': btLCD,
+            'etLCD': etLCD,
+            'timeLCD': timeLCD,
+            'bt': bt,
+            'et': et,
+            'rorBt': ror_bt,
+            'rorEt': ror_et,
+            'unitBt': unit,
+            'unitEt': unit,
+            'title': title,
+            'samples': samples
+        }
+        
+        # Curve data
+        curve_t = [None if (v := _safe_float(t)) is None else v - t0 for t in self.timex]
+        curve_bt = [_safe_float(v) for v in self.temp2]
+        curve_et = [_safe_float(v) for v in self.temp1]
+        curve_ror_bt = [_safe_float(v) for v in self.delta2]
+        curve_ror_et = [_safe_float(v) for v in self.delta1]
+        
+        curve_dict:dict[str, Any] = {
+            't': curve_t,
+            'bt': curve_bt,
+            'et': curve_et,
+            'rorBt': curve_ror_bt,
+            'rorEt': curve_ror_et
+        }
+        
+        # Events
+        events_list:list[dict[str, Any]] = []
+        
+        # Main events from timeindex: CHARGE[0], DRY[1], FCs[2], FCe[3], SCs[4], SCe[5], DROP[6]
+        main_event_names = ['CHARGE', 'DRY', 'FCs', 'FCe', 'SCs', 'SCe', 'DROP']
+        for i, idx in enumerate(self.timeindex[:7]):
+            # CHARGE (0) uses -1 as "not set", all other event slots use 0 as "not set"
+            if (idx >= 0 if i == 0 else idx > 0) and idx < len(self.timex):
+                events_list.append({
+                    'type': i,
+                    'label': main_event_names[i],
+                    'time': None if (v := _safe_float(self.timex[idx])) is None else v - t0,
+                    'value': _safe_float(self.temp2[idx]) if idx < len(self.temp2) else None
+                })
+        
+        # Custom events from specialevents
+        for i in range(len(self.specialevents)):
+            if i < len(self.specialeventstype) and i < len(self.specialeventsvalue):
+                event_idx = self.specialevents[i]
+                if event_idx >= 0 and event_idx < len(self.timex):
+                    event_type = self.specialeventstype[i]
+                    event_label = self.etypes[event_type] if event_type < len(self.etypes) else f'Event{event_type}'
+                    events_list.append({
+                        'type': event_type + 10,  # offset to distinguish from main events
+                        'label': event_label,
+                        'time': None if (v := _safe_float(self.timex[event_idx])) is None else v - t0,
+                        'value': _safe_float(self.specialeventsvalue[i])
+                    })
+        
+        return {
+            'state': state_dict,
+            'curve': curve_dict,
+            'events': events_list
+        }
+    
+    def updateWebMirror(self, bt:str, et:str, time:str) -> None:
+        """Publish a snapshot to WebMirror server if active."""
+        # ponytail: every publish resends the full curve, so payload grows with roast length
+        # (~30KB at 15min/1Hz). Ceiling: LAN/mobile over WiFi. Upgrade path: send only new
+        # points since the client's last index, keep the full snapshot for fresh clients.
+        self.mirror_lcd = (bt, et, time)
+        self.refreshWebMirror()
+
+    def refreshWebMirror(self) -> None:
+        """Publish a snapshot from the last known LCD strings (used outside the sampling cycle)."""
+        if self.aw.webmirror_server is not None:
+            try:
+                bt, et, time = self.mirror_lcd
+                self.aw.webmirror_server.publish(self.mirrorSnapshot(bt, et, time))
+            except Exception as e:
+                _log.exception(e)
+
+    @pyqtSlot(str)
+    def mirrorControl(self, cmd:str) -> None:
+        """Applies a WebMirror control command. Runs on the GUI thread (queued signal)."""
+        try:
+            if cmd == 'start':
+                if not self.flagstart:
+                    self.toggleRecorderTigger()
+            elif cmd == 'stop':
+                if self.flagstart:
+                    self.toggleRecorderTigger()
+            elif cmd == 'off':
+                if self.flagon:
+                    self.toggleMonitorTigger()
+            elif cmd == 'charge':
+                if self.timeindex[0] < 0:
+                    self.markChargeDelaySignal.emit(1 if self.flagstart else self.delay * 2)
+            else:
+                # event slots: timeindex 0 marks "not set" for all events except CHARGE (-1)
+                slots:dict[str, int] = {'drop': 6, 'dry': 1, 'fcs': 2, 'fce': 3, 'scs': 4, 'sce': 5}
+                if cmd in slots:
+                    slot = slots[cmd]
+                    if self.flagstart and self.timeindex[slot] == 0:
+                        signal = {
+                            'drop': self.markDropSignal, 'dry': self.markDRYSignal,
+                            'fcs': self.markFCsSignal, 'fce': self.markFCeSignal,
+                            'scs': self.markSCsSignal, 'sce': self.markSCeSignal,
+                        }[cmd]
+                        signal.emit(False)
+            # the command can be issued while no sampling cycle runs (e.g. after the roast ended),
+            # so the page state is refreshed here instead of waiting for the next sample
+            self.refreshWebMirror()
+        except Exception as e: # pylint: disable=broad-except
+            _log.exception(e)
+
 
     # helper function to update fill_petween PolyCollections
     @staticmethod
